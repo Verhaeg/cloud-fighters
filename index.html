@@ -156,12 +156,26 @@ function fbm(x, y, oct) {
   return s / n;
 }
 const height = (x, y) => fbm(x / 170, y / 170, 5);
+// terrain elevation (world units, 1 = 100 ft): sea and lowlands at 0, the rocky island cores rise into mountains
+const elevFrom = (h, x, y) => {
+  if (h < .6) return 0;
+  const m = (h - .6) / .2;
+  return Math.max(0, Math.min(1.15, m) ** 2 * 64 + (m > .25 ? (vnoise(x / 11, y / 11) - .5) * 6 * Math.min(1, m) : 0)); // peaks ~8,800 ft, below the 10,000 ft ceiling
+};
+function terrainH(x, y) { // fast path from the chunk cache, exact noise fallback when the chunk isn't built
+  const ix = Math.floor(x), iy = Math.floor(y), ch = chunks.get(ckey(ix >> 7, iy >> 7));
+  return ch ? ch.el[((iy & 127) << 7) | (ix & 127)] : elevFrom(height(ix, iy), ix, iy);
+}
 const C = {
   deep:[29,79,153], ocean:[42,107,189], shallow:[61,143,214], foam:[214,236,250], wave:[200,226,247],
   sand:[233,217,166], grass:[88,162,46], light:[109,185,58], dark:[63,138,38],
   forest:[42,104,30], forest2:[31,82,22], rock:[138,138,138], rock2:[104,104,108],
-  street:[96,98,104], roof1:[168,86,70], roof2:[190,182,166], roof3:[124,130,142],
+  snow:[238,243,250], snow2:[206,218,234], street:[96,98,104], roof1:[168,86,70], roof2:[190,182,166], roof3:[124,130,142],
 };
+const CLIFF_LOW = [[96, 128, 58], [86, 116, 52], [112, 100, 74], [90, 122, 56]];   // earth + grass ledges
+const CLIFF_ROCK = [[132, 124, 114], [116, 110, 102], [144, 136, 124], [104, 98, 94]]; // layered rock
+const CLIFF_SNOW = [[234, 240, 248], [210, 220, 234], [240, 244, 252], [200, 212, 228]];
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + .5) / 16);
 const LCOL = [null, [255, 214, 122], [255, 243, 204], [255, 158, 80], [160, 230, 255]]; // city light colors
 const CH = 128, chunks = new Map();
 function lightLayer(ch) { // top view: the chunk's lights as a transparent canvas, built on first night use
@@ -174,9 +188,12 @@ const ckey = (cx, cy) => cx * 65536 + cy;
 function genChunk(cx, cy) {
   const c = document.createElement('canvas'); c.width = c.height = CH;
   const g = c.getContext('2d'), img = g.createImageData(CH, CH), d = img.data, water = new Uint8Array(CH * CH), lt = new Uint8Array(CH * CH);
-  const bx = cx * CH, by = cy * CH;
+  const bx = cx * CH, by = cy * CH, N = CH + 1, raw = new Uint32Array(CH * CH), el = new Float32Array(CH * CH), hb = new Float32Array(N * N), eb = new Float32Array(N * N);
+  for (let j = -1; j < CH; j++) for (let i = -1; i < CH; i++) { // heights + elevation with a 1-texel border for hillshading
+    const x = bx + i, y = by + j, k = (j + 1) * N + i + 1, raw = height(x, y); hb[k] = raw + (hash(x, y) - .5) * .014; eb[k] = elevFrom(raw, x, y); // dither only the colors, not the relief
+  }
   for (let j = 0; j < CH; j++) for (let i = 0; i < CH; i++) {
-    const x = bx + i, y = by + j, r = hash(x, y), h = height(x, y) + (r - .5) * .014;
+    const x = bx + i, y = by + j, r = hash(x, y), kb = (j + 1) * N + i + 1, h = hb[kb], E = eb[kb];
     let col, tw;
     if (h < .556) { water[j * CH + i] = 1; col = h < .42 ? C.deep : h < .525 ? C.ocean : h < .548 ? C.shallow : (r < .55 ? C.foam : C.shallow); }
     else if (h < .567) col = C.sand;
@@ -200,17 +217,25 @@ function genChunk(cx, cy) {
       }
       else col = r < .06 ? C.dark : C.grass;
     }
+    el[j * CH + i] = E;
+    if (!(E > 0)) raw[j * CH + i] = rgb32(col);
+    if (E > 0) { // mountains: snow caps + hillshade lit from the north-west
+      if (E > 62 + r * 5) col = r < .3 ? C.snow2 : C.snow; // snow only on the high peaks, ragged snow line
+      raw[j * CH + i] = rgb32(col);
+      const sh = clamp(1 + (E - eb[j * N + i]) * .09, .55, 1.45);
+      col = [Math.min(255, col[0] * sh), Math.min(255, col[1] * sh), Math.min(255, col[2] * sh)];
+    }
     const k = (j * CH + i) * 4; d[k] = col[0]; d[k + 1] = col[1]; d[k + 2] = col[2]; d[k + 3] = 255;
   }
   for (let n = 0; n < 70; n++) { // little diagonal wave streaks on water
     const i = (hash(bx + n * 7919, by - n * 1047) * CH) | 0, j = (hash(by + n * 31, bx - n * 17) * CH) | 0;
     for (let s = 0; s < 3; s++) {
       const ii = i + s, jj = j - s;
-      if (ii < CH && jj >= 0 && water[jj * CH + ii]) { const k = (jj * CH + ii) * 4; d[k] = C.wave[0]; d[k + 1] = C.wave[1]; d[k + 2] = C.wave[2]; }
+      if (ii < CH && jj >= 0 && water[jj * CH + ii]) { const k = (jj * CH + ii) * 4; d[k] = C.wave[0]; d[k + 1] = C.wave[1]; d[k + 2] = C.wave[2]; raw[jj * CH + ii] = rgb32(C.wave); }
     }
   }
   g.putImageData(img, 0, 0);
-  chunks.set(ckey(cx, cy), { c, px: new Uint32Array(d.buffer), lt, lc: null, cx, cy });
+  chunks.set(ckey(cx, cy), { c, px: new Uint32Array(d.buffer), raw, lt, el, lc: null, cx, cy });
 }
 function ensureChunks(budget) {
   const x0 = Math.floor((ox - CH) / CH), x1 = Math.floor((ox + W + CH) / CH);
@@ -264,6 +289,8 @@ function updateTime(dt) {
   LIGHT.light = (LIGHT.tint[0] + LIGHT.tint[1] + LIGHT.tint[2]) / 3;
   LIGHT.night = clamp((.8 - LIGHT.light) / .45, 0, 1); // city lights / nav lights strength
   LIGHT.bucket = Math.floor(tod * 2); // sprites and palettes re-tint every half game-hour
+  const ang = (tod - 6) / 12 * Math.PI, up = Math.sin(ang), nrm = v => { const l = Math.hypot(...v); return v.map(c => c / l); };
+  if (up > -.05) { LIGHT.sun = nrm([Math.cos(ang), .45, Math.max(.14, up)]); LIGHT.amb = .36; } else { LIGHT.sun = nrm([-.3, .4, .8]); LIGHT.amb = .7; }
   const T = LIGHT.tint; LIGHT.rgb = (r, g, b, a) => `rgba(${r * T[0] | 0},${g * T[1] | 0},${b * T[2] | 0},${a})`;
 }
 const hex2rgb = h => { if (h.length === 4) h = '#' + h[1] + h[1] + h[2] + h[2] + h[3] + h[3]; const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
@@ -422,7 +449,8 @@ function drawJet(o, shadow) {
   const alt = hOf(o) - 18, pitch = o.pitch || 0, inv = Math.cos(pitch) < 0;
   const ang = o.a + (inv ? Math.PI : 0), grow = 1 + alt / 150, fore = Math.max(.3, Math.abs(Math.cos(pitch))) * grow;
   const cv = topSprite(o.m, shadow ? o.pal : tp(o.hit > 0 ? PAL.flash : o.pal), o.s, ang, o.bank, pyl, shadow);
-  const x = Math.round(o.x - ox + (shadow ? 9 * o.s + alt * .7 : 0)), y = Math.round(o.y - oy + (shadow ? 13 * o.s + alt * .9 : 0));
+  const sAlt = shadow ? hOf(o) - terrainH(o.x, o.y) - 18 : 0;
+  const x = Math.round(o.x - ox + (shadow ? 9 * o.s + sAlt * .7 : 0)), y = Math.round(o.y - oy + (shadow ? 13 * o.s + sAlt * .9 : 0));
   const blit = () => { // stretch along the nose axis for pitch foreshortening, grow with altitude
     if (fore === 1 && grow === 1) return ctx.drawImage(cv, x - cv.width / 2, y - cv.height / 2);
     ctx.save(); ctx.translate(x, y); ctx.rotate(ang); ctx.scale(fore, grow); ctx.rotate(-ang); ctx.drawImage(cv, -cv.width / 2, -cv.height / 2); ctx.restore();
@@ -542,6 +570,8 @@ function tryStart() {
   state = 'play'; score = 0; wave = 0; waveTimer = 1.2;
   const keepX = P.x, keepY = P.y, keepA = P.a;
   P = newPlayer(); P.x = keepX; P.y = keepY; P.a = keepA;
+  let top = 0; for (let d = 0; d <= 300; d += 15) top = Math.max(top, terrainH(P.x + Math.cos(P.a) * d, P.y + Math.sin(P.a) * d));
+  P.h = Math.max(18, top + 15);
   enemies = []; bullets = []; missiles = [];
   $('screen').classList.add('hidden'); applyMode();
 }
@@ -570,10 +600,10 @@ function spawnWave() {
   for (let i = 0; i < n + heavies; i++) spawnEnemy(i < heavies ? 'heavy' : i < heavies + inters ? 'inter' : 'fighter');
 }
 const hOf = o => (o.h ?? 18) + (o.alt || 0); // absolute height: cruise height + maneuver offset
-const H_MIN = 6, H_MAX = 150;
+const H_MIN = 6, H_MAX = 100; // 600 ft .. 10,000 ft
 function spawnEnemy(type) {
   const a = rnd(0, TAU), d = rnd(Math.max(W, H) * .7, Math.max(W, H) * .9) + 80, T = TYPES[type];
-  enemies.push({ type, x: P.x + Math.cos(a) * d, y: P.y + Math.sin(a) * d, a: a + Math.PI + rnd(-.5, .5), h: clamp(hOf(P) + rnd(-20, 20), 10, 120), seed: rnd(0, 9),
+  enemies.push({ type, x: P.x + Math.cos(a) * d, y: P.y + Math.sin(a) * d, a: a + Math.PI + rnd(-.5, .5), h: clamp(hOf(P) + rnd(-20, 20), 10, 95), seed: rnd(0, 9),
     m: T.m, pal: T.pal, spd: T.spd, hp: T.hp, s: T.s, r: T.r, turn: T.turn, pts: T.pts,
     cd: rnd(1, 2.5), burst: 0, bcd: 0, bank: 0, hit: 0, trail: [], dead: false, boosting: false });
 }
@@ -689,7 +719,11 @@ function updatePlayer(dt) {
     }
   }
   p.hit -= dt;
-  if (!playing) return;
+  if (!playing) { if (state === 'menu') p.h += (Math.max(18, terrainH(p.x + p.vx * 1.5, p.y + p.vy * 1.5) + 20) - p.h) * Math.min(1, dt * 2); return; }
+  const gH = terrainH(p.x, p.y);
+  if (hOf(p) < gH + 1) { hurtPlayer(999); return; } // flew into the terrain
+  p.gpws = false; // terrain-ahead warning: will we be below the ground in the next ~2 s?
+  for (const t of [.4, .8, 1.3, 1.9]) if (terrainH(p.x + p.vx * t, p.y + p.vy * t) + 3 > hOf(p) + p.vs * t) { p.gpws = true; break; }
 
   p.gunCd -= dt;
   if ((mouse.down || touch.fire || keys.Space || keys.KeyJ) && p.gunCd <= 0 && !(M && M.type === 'loop')) {
@@ -719,7 +753,10 @@ function updateEnemies(dt) {
     const sp = e.confused > 0 ? e.spd * 1.25 : dist > 330 ? e.spd * 1.6 : e.spd; e.boosting = dist > 330 || e.confused > 0;
     e.vx = Math.cos(e.a) * sp; e.vy = Math.sin(e.a) * sp;
     e.x += e.vx * dt; e.y += e.vy * dt; e.hit -= dt;
-    if (!(e.confused > 0) && P.alive) { const c = e.turn * 9 * dt; e.vs = clamp(hOf(P) - e.h, -c, c) / dt; e.h = clamp(e.h + e.vs * dt, H_MIN, H_MAX); } else e.vs = 0;
+    let clear = 0; for (const t of [0, .8, 1.6, 2.5]) clear = Math.max(clear, terrainH(e.x + e.vx * t, e.y + e.vy * t)); clear += 12;
+    const wantH = Math.max(clear, e.confused > 0 || !P.alive ? e.h : hOf(P)), c = (e.h < clear ? 32 : e.turn * 9) * dt;
+    e.vs = clamp(wantH - e.h, -c, c) / dt; e.h = clamp(e.h + e.vs * dt, H_MIN, H_MAX);
+    if (e.h < terrainH(e.x, e.y) + 1) { hurtEnemy(e, 999); continue; } // didn't clear the ridge
     trail(e, dt);
     if (!P.alive || state !== 'play' || e.confused > 0) continue; // confused: overshooting, no firing, no ramming
     e.cd -= dt;
@@ -736,6 +773,7 @@ function updateEnemies(dt) {
 function updateShots(dt) {
   for (const b of bullets) {
     b.x += b.vx * dt; b.y += b.vy * dt; b.h += b.vh * dt; b.life -= dt;
+    if (b.h < terrainH(b.x, b.y)) { b.life = 0; parts.push({ k: 'smoke', x: b.x, y: b.y, h: b.h, vx: 0, vy: 0, life: .4, max: 1.2, size: 1 }); continue; } // hit the ground
     if (b.owner === 'p') {
       for (const e of enemies) if (!e.dead && Math.abs(b.h - e.h) < e.r && (b.x - e.x) ** 2 + (b.y - e.y) ** 2 < e.r * e.r) {
         hurtEnemy(e, 1); b.life = 0; parts.push({ k: 'fire', x: b.x, y: b.y, h: b.h, vx: 0, vy: 0, life: .12, max: .3, size: 2 }); break;
@@ -751,7 +789,7 @@ function updateShots(dt) {
     m.x += Math.cos(m.a) * m.spd * dt; m.y += Math.sin(m.a) * m.spd * dt;
     if (m.t && m.age > .15) m.h += clamp(m.t.h - m.h, -80 * dt, 80 * dt); // missiles climb/dive after the target
     if ((m.smoke -= dt) <= 0 && m.age > .15) { m.smoke = .02; parts.push({ k: 'puff', x: m.x, y: m.y, h: m.h, vx: rnd(-4, 4), vy: rnd(-4, 4), life: .9, max: .9, size: 1.5 }); }
-    let boom = m.age > 3.5;
+    let boom = m.age > 3.5 || m.h < terrainH(m.x, m.y);
     for (const e of enemies) if (!e.dead && Math.abs(e.h - m.h) < e.r + 4 && Math.hypot(e.x - m.x, e.y - m.y) < e.r + 4) boom = true;
     if (boom) {
       m.dead = true; explode(m.x, m.y, .7, m.h);
@@ -837,6 +875,13 @@ function drawIndicators() {
     ctx.restore();
   }
 }
+function drawTerrainWarn() { // GPWS-style warning for the top and chase views
+  if (state !== 'play' || !P.alive || !P.gpws || performance.now() % 500 > 300) return;
+  ctx.font = '8px Silkscreen, monospace'; ctx.textAlign = 'center';
+  const x = Math.round(W / 2), y = Math.round(H * .3), t = 'TERRENO!  SUBA';
+  ctx.fillStyle = '#14161c'; for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) ctx.fillText(t, x + dx, y + dy);
+  ctx.fillStyle = '#ff4b3a'; ctx.fillText(t, x, y);
+}
 function drawLock() {
   if (!lock || state !== 'play' || !P.alive) return;
   const x = Math.round(lock.x - ox), y = Math.round(lock.y - oy), r = Math.round(lock.r + 5), l = 4;
@@ -848,7 +893,7 @@ function drawLock() {
   ctx.stroke();
 }
 // ---------- 3D views (chase + cockpit): per-pixel Mode-7 with roll (no rotated bitmaps) + pixel-art billboards ----------
-let offImg = null, off32 = null, camA = null, lastDt = 1 / 60;
+let offImg = null, off32 = null, depth = null, camA = null, lastDt = 1 / 60;
 const rgb32 = ([r, g, b]) => (255 << 24 | b << 16 | g << 8 | r) >>> 0;
 const OCEAN32 = rgb32(C.ocean), HAZE = [205, 228, 246], SKY = [96, 160, 226], ALT = 18, MAXD = 1150;
 const SKYLUT = new Uint32Array(256);
@@ -978,76 +1023,150 @@ function puffSprite(r) { // one 3-tone hard-edged cloud puff for the 3D views
 function draw3D() {
   const cockpit = view === 2;
   if (!offImg || offImg.width !== W || offImg.height !== H) { offImg = ctx.createImageData(W, H); off32 = new Uint32Array(offImg.data.buffer); }
-  // true 3D camera: forward/up follow the plane's pitch, so the loop stays behind the jet the whole way (upside down at the top, no flip)
+  // true 3D camera: forward/up follow the plane's pitch, so the loop stays behind the jet the whole way
   if (camA === null || cockpit || P.man) camA = P.a; else camA += angDiff(camA, P.a) * Math.min(1, lastDt * 3.2); // chase cam lags the turn
   const a = camA, hx = Math.cos(a), hy = Math.sin(a), th = P.pitch || 0, cth = Math.cos(th), sth = Math.sin(th);
-  let Fx = cth * hx, Fy = cth * hy, Fz = sth, Ux = -sth * hx, Uy = -sth * hy, Uz = cth;
-  const Rx = -hy, Ry = hx, back = cockpit ? 0 : 60, lift = cockpit ? 0 : 9, f = W * .75;
+  let Fx = cth * hx, Fy = cth * hy, Fz = sth, Ux = -sth * hx, Uy = -sth * hy, Uz = cth, Rx = -hy, Ry = hx;
+  const back = cockpit ? 0 : 60, lift = cockpit ? 0 : 9, f = W * .75;
   let Cx = P.x - Fx * back + Ux * lift, Cy = P.y - Fy * back + Uy * lift, Cz = hOf(P) - Fz * back + Uz * lift;
-  if (Cz < 3) { // chase cam would go underground (nose-high near the ground): raise it and re-aim at the jet so it stays in frame
-    Cz = 3; // keep the same distance to the jet: slide back horizontally instead of creeping up to it
+  const gnd = terrainH(Cx, Cy) + 3;
+  if (!cockpit && Cz < gnd) { // chase cam would go into the ground: raise it, keep the distance, re-aim at the jet
+    Cz = gnd;
     const hd = Math.sqrt(Math.max(400, back * back - (hOf(P) - Cz) ** 2)); Cx = P.x - hx * hd; Cy = P.y - hy * hd;
     const tx = P.x + Ux * lift + Fx * 20 - Cx, ty = P.y + Uy * lift + Fy * 20 - Cy, tz = hOf(P) + Uz * lift + Fz * 20 - Cz;
     const ph = Math.atan2(tz, tx * hx + ty * hy), c2 = Math.cos(ph), s2 = Math.sin(ph);
     Fx = c2 * hx; Fy = c2 * hy; Fz = s2; Ux = -s2 * hx; Uy = -s2 * hy; Uz = c2;
   }
-  const roll = cockpit ? -P.bank * .3 : -P.bank * .1, cr = Math.cos(roll), sr = Math.sin(roll);
+  // render with an upright camera; if we're upside down, render rolled 180 and flip the finished frame (pixel-exact)
+  const flip = Uz < 0;
+  if (flip) { Ux = -Ux; Uy = -Uy; Uz = -Uz; Rx = -Rx; Ry = -Ry; }
+  const roll = cockpit ? -P.bank * .3 : -P.bank * .1, sh = Math.sin(roll); // bank as a column shear: keeps the pixel grid intact
   const pcx = W / 2, pcy = Math.round(H * .38);
-  const [hr, hg, hb] = LIGHT.hor.map(v => v | 0), skyK = f / (H * .45), maxZ = MAXD;
+  const [hr, hg, hb] = LIGHT.hor.map(v => v | 0), skyK = f / (H * .45);
   for (let i = 0; i < 256; i++) { const k = (i / 255) ** 2; SKYLUT[i] = rgb32(LIGHT.zen.map((c, j) => c + (LIGHT.hor[j] - c) * k | 0)); }
   const TR = LIGHT.tint[0] * 256 | 0, TG = LIGHT.tint[1] * 256 | 0, TB = LIGHT.tint[2] * 256 | 0, NF = LIGHT.night * 256 | 0, ST = LIGHT.stars;
-  const az0 = a * 260, azK = 260 / f;
-  let o = 0, lcx = 1e9, lcy = 1e9, px = null, lt = null;
-  for (let y = 0; y < H; y++) {
-    const ddy = y - pcy;
-    for (let x = 0; x < W; x++, o++) {
-      const ddx = x - pcx, u = ddx * cr + ddy * sr, v = -ddx * sr + ddy * cr;
-      const dZ = Fz * f - Uz * v; // ray's vertical component (screen v points down)
-      if (dZ >= 0 || Cz * f > -dZ * maxZ) {
-        let sc = SKYLUT[clamp(1 - dZ / f * skyK, 0, 1) * 255 | 0];
-        if (ST > .05 && dZ > f * .03) { // stars, fixed to the sky direction
-          const sh = Math.imul(Math.floor(az0 + u * azK) * 73856093 ^ Math.floor(dZ * azK) * 19349663, 2654435761) >>> 0;
-          if ((sh & 1023) < 4) { const bv = (150 + (sh >>> 24 & 105)) * ST | 0; sc = (255 << 24 | Math.max(bv, sc >> 16 & 255) << 16 | Math.max(bv, sc >> 8 & 255) << 8 | Math.max(bv, sc & 255)) >>> 0; }
+  const az0 = a * 260 * (flip ? -1 : 1), azK = 260 / f;
+  if (!depth || depth.length !== W * H) depth = new Float32Array(W * H);
+  const skyPx = (u, v) => { // sky gradient + stars for a pixel in camera space
+    const dZ = Fz * f - Uz * v;
+    let sc = SKYLUT[clamp(1 - dZ / f * skyK, 0, 1) * 255 | 0];
+    if (ST > .05 && dZ > f * .03) {
+      const s2 = Math.imul(Math.floor(az0 + u * azK) * 73856093 ^ Math.floor(dZ * azK) * 19349663, 2654435761) >>> 0;
+      if ((s2 & 1023) < 4) { const bv = (150 + (s2 >>> 24 & 105)) * ST | 0; sc = (255 << 24 | Math.max(bv, sc >> 16 & 255) << 16 | Math.max(bv, sc >> 8 & 255) << 8 | Math.max(bv, sc & 255)) >>> 0; }
+    }
+    return sc;
+  };
+  let lcx = 1e9, lcy = 1e9, px = null, lt = null, el = null;
+  const ground = (wx, wy, dist) => { // shaded, tinted, lit, fogged ground color at a world point (chunk vars cached by caller)
+    const ix = Math.floor(wx), iy = Math.floor(wy), ccx = ix >> 7, ccy = iy >> 7;
+    if (ccx !== lcx || ccy !== lcy) { lcx = ccx; lcy = ccy; const ch = chunks.get(ckey(ccx, ccy)); px = ch ? ch.px : null; lt = ch ? ch.lt : null; el = ch ? ch.el : null; }
+    const ti = ((iy & 127) << 7) | (ix & 127), col = px ? px[ti] : OCEAN32;
+    let r = col & 255, g = (col >> 8) & 255, b = (col >> 16) & 255;
+    if (dist < 200) { // sub-texel grain so magnified ground keeps pixel-sized detail
+      const h = Math.imul(Math.floor(wx * 4) ^ Math.imul(Math.floor(wy * 4), 668265263), 374761393) >>> 26, n = (h & 7) - 3;
+      if (b > g) { if (h === 63 && (ix + iy & 3) === 0) r = g = b = 236; else { r += n; g += n * 2; b += n * 2; } }
+      else { r += n * 4; g += n * 4; b += n * 3; }
+      r = r < 0 ? 0 : r > 255 ? 255 : r; g = g < 0 ? 0 : g > 255 ? 255 : g; b = b < 0 ? 0 : b > 255 ? 255 : b;
+    }
+    r = r * TR >> 8; g = g * TG >> 8; b = b * TB >> 8;
+    if (NF && lt && lt[ti]) { const L = LCOL[lt[ti]]; r += (L[0] - r) * NF >> 8; g += (L[1] - g) * NF >> 8; b += (L[2] - b) * NF >> 8; }
+    const t = Math.min(1, dist / MAXD), fi = t * t * 256 | 0;
+    return (255 << 24 | (b + ((hb - b) * fi >> 8)) << 16 | (g + ((hg - g) * fi >> 8)) << 8 | (r + ((hr - r) * fi >> 8))) >>> 0;
+  };
+  const camPitch = Math.atan2(Fz, Uz);
+  if (Math.abs(camPitch) < .85) {
+    // voxel-space terrain: per screen column, march the ground line front-to-back, project each sample's height exactly.
+    // Each span gets a surface pixel (map texture) and, on steep ground, a cliff face with height-based rock strata;
+    // everything is lit by the sun (time of day) from the terrain normal, quantized to 4 tones with ordered dithering.
+    const SX = LIGHT.sun[0], SY = LIGHT.sun[1], SZ = LIGHT.sun[2], AMB = LIGHT.amb, NORM = 1 / (AMB + (1 - AMB) * SZ);
+    let rw = null;
+    for (let x = 0; x < W; x++) {
+      const u = x - pcx, yOff = pcy + u * sh;
+      let Dx = Fx * f + Rx * u, Dy = Fy * f + Ry * u; const L = Math.hypot(Dx, Dy) || 1; Dx /= L; Dy /= L;
+      const a1 = Dx * Fx + Dy * Fy, b1 = Dx * Ux + Dy * Uy;
+      let ybuf = H, d = 1.5, pE = -1;
+      while (d < MAXD && ybuf > 0) {
+        const wx = Cx + Dx * d, wy = Cy + Dy * d, ix = Math.floor(wx), iy = Math.floor(wy), ccx = ix >> 7, ccy = iy >> 7;
+        if (ccx !== lcx || ccy !== lcy) { lcx = ccx; lcy = ccy; const ch = chunks.get(ckey(ccx, ccy)); px = ch ? ch.px : null; lt = ch ? ch.lt : null; el = ch ? ch.el : null; rw = ch ? ch.raw : null; }
+        const xi = ix & 127, yi = iy & 127, ti = (yi << 7) | xi, E = el ? el[ti] : 0, dz = E - Cz, fw = d * a1 + dz * Fz;
+        if (pE < 0) pE = E;
+        if (fw > 1) {
+          const yt = Math.floor(yOff - (d * b1 + dz * Uz) * f / fw);
+          if (yt < ybuf) {
+            const col = rw ? rw[ti] : OCEAN32;
+            let r0 = col & 255, g0 = (col >> 8) & 255, b0 = (col >> 16) & 255;
+            if (fw < 200) { // sub-texel grain so magnified ground keeps pixel-sized detail
+              const h = Math.imul(Math.floor(wx * 4) ^ Math.imul(Math.floor(wy * 4), 668265263), 374761393) >>> 26, n = (h & 7) - 3;
+              if (b0 > g0) { if (h === 63 && (ix + iy & 3) === 0) r0 = g0 = b0 = 236; else { r0 += n; g0 += n * 2; b0 += n * 2; } }
+              else { r0 += n * 4; g0 += n * 4; b0 += n * 3; }
+            }
+            let Lf = 1; // sun light from the terrain normal (1 = flat ground)
+            if (E > .3 && el) {
+              const ex = (xi < 127 ? el[ti + 1] : E) - (xi > 0 ? el[ti - 1] : E), ey = (yi < 127 ? el[ti + 128] : E) - (yi > 0 ? el[ti - 128] : E);
+              const nx = -ex * .5, ny = -ey * .5, inv = 1 / Math.sqrt(nx * nx + ny * ny + 1);
+              Lf = (AMB + (1 - AMB) * Math.max(0, (nx * SX + ny * SY + SZ) * inv)) * NORM;
+            }
+            const lit = NF && lt && lt[ti] ? LCOL[lt[ti]] : null;
+            const t2 = Math.min(1, fw / MAXD), fi = t2 * t2 * 256 | 0, top = yt < 0 ? 0 : yt, span = ybuf - yt, steep = span > 2 && E > .3;
+            const sOff = ((Math.imul(ix >> 3, 73856093) ^ Math.imul(iy >> 3, 19349663)) >>> 28) * .2;
+            for (let y = top, o = top * W + x; y < ybuf; y++, o += W) {
+              let r = r0, g = g0, b = b0;
+              if (steep && y > yt) { // cliff face below the rim: rock strata by height
+                const Ep = E + (pE - E) * (y - yt) / span, band = (Ep * .45 + sOff) & 3;
+                const C3 = (Ep > 62 + sOff * 6 ? CLIFF_SNOW : Ep > 16 + sOff * 5 ? CLIFF_ROCK : CLIFF_LOW)[band];
+                r = C3[0]; g = C3[1]; b = C3[2];
+              }
+              if (Lf !== 1) { // 4-tone light with a 4x4 Bayer dither between tones
+                const q = clamp(Math.floor(Lf * 6 + BAYER4[(y & 3) << 2 | (x & 3)] - .5), 2, 9) / 6; // 6 tones: finer dither
+                r *= q; g *= q; b *= q;
+              }
+              r = r < 0 ? 0 : r > 255 ? 255 : r; g = g < 0 ? 0 : g > 255 ? 255 : g; b = b < 0 ? 0 : b > 255 ? 255 : b;
+              r = r * TR >> 8; g = g * TG >> 8; b = b * TB >> 8;
+              if (lit && !(steep && y > yt)) { r += (lit[0] - r) * NF >> 8; g += (lit[1] - g) * NF >> 8; b += (lit[2] - b) * NF >> 8; }
+              off32[o] = (255 << 24 | (b + ((hb - b) * fi >> 8)) << 16 | (g + ((hg - g) * fi >> 8)) << 8 | (r + ((hr - r) * fi >> 8))) >>> 0;
+              depth[o] = fw;
+            }
+            ybuf = top;
+          }
         }
-        off32[o] = sc; continue;
+        pE = E;
+        d += d < 24 ? .4 : d * .015;
       }
+      for (let y = 0, o = x; y < ybuf; y++, o += W) { off32[o] = skyPx(u, y - yOff); depth[o] = Infinity; }
+    }
+  } else {
+    // steep nose (middle of a loop / break): exact flat-ground ray cast; mountains show as their shaded texture
+    let o = 0;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++, o++) {
+      const u = x - pcx, v = y - pcy - u * sh, dZ = Fz * f - Uz * v;
+      if (dZ >= 0 || Cz * f > -dZ * MAXD) { off32[o] = skyPx(u, v); depth[o] = Infinity; continue; }
       const tt = Cz / -dZ, dist = tt * f;
-      const wx = Cx + (Fx * f + Rx * u - Ux * v) * tt, wy = Cy + (Fy * f + Ry * u - Uy * v) * tt;
-      const ix = Math.floor(wx), iy = Math.floor(wy), ccx = ix >> 7, ccy = iy >> 7;
-      if (ccx !== lcx || ccy !== lcy) { lcx = ccx; lcy = ccy; const ch = chunks.get(ckey(ccx, ccy)); px = ch ? ch.px : null; lt = ch ? ch.lt : null; }
-      const ti = ((iy & 127) << 7) | (ix & 127), col = px ? px[ti] : OCEAN32;
-      let r = col & 255, g = (col >> 8) & 255, b = (col >> 16) & 255;
-      if (dist < 200) { // magnified texels: sub-texel grain so the ground near the camera keeps pixel-sized detail
-        const h = Math.imul(Math.floor(wx * 4) ^ Math.imul(Math.floor(wy * 4), 668265263), 374761393) >>> 26, n = (h & 7) - 3;
-        if (b > g) { if (h === 63 && (ix + iy & 3) === 0) r = g = b = 236; else { r += n; g += n * 2; b += n * 2; } }
-        else { r += n * 4; g += n * 4; b += n * 3; }
-        r = r < 0 ? 0 : r > 255 ? 255 : r; g = g < 0 ? 0 : g > 255 ? 255 : g; b = b < 0 ? 0 : b > 255 ? 255 : b;
-      }
-      r = r * TR >> 8; g = g * TG >> 8; b = b * TB >> 8;
-      if (NF && lt && lt[ti]) { const L = LCOL[lt[ti]]; r += (L[0] - r) * NF >> 8; g += (L[1] - g) * NF >> 8; b += (L[2] - b) * NF >> 8; }
-      const t = dist / MAXD, fi = t * t * 256 | 0;
-      off32[o] = (255 << 24 | (b + ((hb - b) * fi >> 8)) << 16 | (g + ((hg - g) * fi >> 8)) << 8 | (r + ((hr - r) * fi >> 8))) >>> 0;
+      off32[o] = ground(Cx + (Fx * f + Rx * u - Ux * v) * tt, Cy + (Fy * f + Ry * u - Uy * v) * tt, dist); depth[o] = dist;
     }
   }
+  if (flip) { off32.reverse(); depth.reverse(); }
   ctx.putImageData(offImg, 0, 0);
 
-  // world point -> camera space -> screen (same roll as the ground)
+  // world point -> camera space -> screen (same shear + flip as the ground); vis = not hidden behind terrain
   const proj = (x, y, z) => {
     const qx = x - Cx, qy = y - Cy, qz = z - Cz, fw = qx * Fx + qy * Fy + qz * Fz;
     if (fw < 4 || fw > MAXD) return null;
     const k = f / fw, u = (qx * Rx + qy * Ry) * k, v = -(qx * Ux + qy * Uy + qz * Uz) * k;
-    return { x: Math.round(pcx + u * cr - v * sr), y: Math.round(pcy + u * sr + v * cr), k, fw };
+    let sx = Math.round(pcx + u), sy = Math.round(pcy + v + u * sh);
+    if (flip) { sx = W - 1 - sx; sy = H - 1 - sy; }
+    const vis = sx < 0 || sx >= W || sy < 0 || sy >= H || depth[sy * W + sx] >= fw - 3;
+    return { x: sx, y: sy, k, fw, vis };
   };
   const list = [];
   for (const c of clouds) for (const p of c.puffs) {
-    const q = proj(c.x + p.dx, c.y + p.dy, ALT + c.z); if (!q) continue;
+    const q = proj(c.x + p.dx, c.y + p.dy, ALT + c.z); if (!q || !q.vis) continue;
     list.push([q.fw, () => { const cv = puffSprite(p.r * q.k * 1.3); ctx.drawImage(cv, q.x - cv.width / 2, q.y - cv.height / 2); }]);
   }
   const t = performance.now() / 1000;
   for (const e of enemies) {
-    const q = proj(e.x, e.y, e.h + Math.sin(t + e.seed) * 1.5); if (!q) continue;
+    const q = proj(e.x, e.y, e.h + Math.sin(t + e.seed) * 1.5); if (!q || !q.vis) continue;
     const rel = angDiff(a, e.a), front = Math.abs(rel) > Math.PI / 2;
-    list.push([q.fw, () => rearJet(q.x, q.y, q.k * e.s, (front ? -e.bank : e.bank) * .6 + Math.sin(rel) * .25 + roll, e, front)]);
+    list.push([q.fw, () => rearJet(q.x, q.y, q.k * e.s, (front ? -e.bank : e.bank) * .6 + Math.sin(rel) * .25 + roll + (flip ? Math.PI : 0), e, front)]);
     if (e === lock) list.push([q.fw - .1, () => {
       const r = Math.max(6, Math.round(14 * q.k * e.s));
       ctx.strokeStyle = P.msl > 0 ? '#7dff9a' : 'rgba(255,255,255,.4)'; ctx.lineWidth = 1;
@@ -1056,15 +1175,15 @@ function draw3D() {
   }
   if (!cockpit && P.alive) { const q = proj(P.x, P.y, hOf(P)); if (q) list.push([q.fw, () => rearJet(q.x, q.y, q.k, P.bank * .62 + roll, P, false)]); }
   for (const b of bullets) {
-    const q = proj(b.x, b.y, b.h - 1), q2 = proj(b.x - b.vx * .03, b.y - b.vy * .03, b.h - 1 - b.vh * .03); if (!q || !q2) continue;
+    const q = proj(b.x, b.y, b.h - 1), q2 = proj(b.x - b.vx * .03, b.y - b.vy * .03, b.h - 1 - b.vh * .03); if (!q || !q2 || !q.vis) continue;
     list.push([q.fw, () => { const c = b.owner === 'p' ? '#ffe27a' : '#ff5a36'; pxLine(ctx, q.x, q.y, q2.x, q2.y, c); if (q.k > 3) pxLine(ctx, q.x + 1, q.y, q2.x + 1, q2.y, c); }]);
   }
   for (const m of missiles) {
-    const q = proj(m.x, m.y, m.h); if (!q) continue;
+    const q = proj(m.x, m.y, m.h); if (!q || !q.vis) continue;
     list.push([q.fw, () => { const s = Math.max(1, Math.round(q.k * 1.5)); rr(ctx, q.x - (s >> 1), q.y - (s >> 1), s, s, '#e9ecf2'); if (s > 2) rr(ctx, q.x - (s >> 2), q.y - (s >> 2), s >> 1, s >> 1, '#ffe27a'); }]);
   }
   for (const p of parts) {
-    const q = proj(p.x, p.y, p.h ?? 18); if (!q) continue;
+    const q = proj(p.x, p.y, p.h ?? 18); if (!q || !q.vis) continue;
     const tt = p.life / p.max;
     const col = p.k === 'fire' ? (tt > .6 ? '#ffe27a' : tt > .3 ? '#ff8a2a' : '#c8312c') : p.k === 'smoke' ? LIGHT.rgb(60, 62, 72, (tt * .7).toFixed(2)) : p.k === 'puff' ? LIGHT.rgb(235, 240, 246, (tt * .75).toFixed(2)) : '#26282f';
     list.push([q.fw, () => { const s = Math.max(1, Math.round(p.size * q.k)); rr(ctx, q.x - (s >> 1), q.y - (s >> 1), s, s, col); }]);
@@ -1073,6 +1192,7 @@ function draw3D() {
   for (const [, fn] of list) fn();
   if (cockpit) drawCockpit(); else { const r = Math.round(Math.min(W, H) * .12); drawRadar(W - r - 6, H - r - 6 - (touchMode ? Math.round(240 / PX) : 0), r); }
   if (state === 'play') drawSideArrows(f);
+  if (!cockpit) drawTerrainWarn();
 }
 function drawRadar(x, y, r) {
   ctx.fillStyle = 'rgba(8,40,22,.82)'; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
@@ -1294,7 +1414,7 @@ function drawCockpit() {
     ctx.beginPath(); ctx.moveTo(x + .5, hy - 40); ctx.lineTo(x + .5, hy + 40); ctx.stroke();
     const bw = 24, bx = side < 0 ? x - bw - 2 : x + 2;
     rr(ctx, bx, hy - 5, bw, 10, 'rgba(0,20,8,.55)'); ctx.strokeRect(Math.round(bx) + .5, hy - 4.5, bw, 9);
-    ctx.textAlign = 'center'; ctx.fillText(String(val), bx + bw / 2, hy + 3);
+    ctx.fillStyle = GREEN; ctx.textAlign = 'center'; ctx.fillText(String(val), bx + bw / 2, hy + 3);
   }
   // pitch ladder rolls with the bank
   ctx.save(); ctx.translate(cx, hy); ctx.rotate(-P.bank * .3);
@@ -1316,7 +1436,7 @@ function drawCockpit() {
   ctx.fillText('M ' + (P.spd / 105).toFixed(2), W * .615, L.y0 - 24);
   if (lock) { ctx.fillText('R ' + (Math.hypot(lock.x - P.x, lock.y - P.y) / 100).toFixed(1), W * .615, L.y0 - 14); if (blink && P.msl) { ctx.textAlign = 'center'; ctx.fillText('LOCK', cx, hy + 34); } }
   if (behind && blink) { ctx.fillStyle = '#ff4b3a'; ctx.textAlign = 'center'; ctx.fillText('WARNING', cx, ty + 26); }
-  if (hOf(P) < 12 && P.vs <= 0 && blink) { ctx.fillStyle = '#ff4b3a'; ctx.textAlign = 'center'; ctx.fillText('PULL UP', cx, hy + 44); }
+  if ((P.gpws || hOf(P) < 12 && P.vs <= 0) && blink) { ctx.fillStyle = '#ff4b3a'; ctx.textAlign = 'center'; ctx.fillText(P.gpws ? 'TERRAIN  PULL UP' : 'PULL UP', cx, hy + 44); }
   ctx.textAlign = 'left'; ctx.fillStyle = GREEN; ctx.fillText('VS ' + Math.round(P.vs * 60), W * .615 - 40, hy + 52);
   ctx.restore();
   // ---- frame + panel (cached), shaken on hits ----
@@ -1393,6 +1513,7 @@ function draw() {
   ctx.globalAlpha = 1;
   drawLock();
   if (state === 'play') drawIndicators();
+  drawTerrainWarn();
 }
 
 // ---------- HUD ----------
@@ -1413,7 +1534,7 @@ function hud() {
     const b = $(btn); b.classList.toggle('cd', cd > 0); b.lastChild.textContent = cd > 0 ? Math.ceil(cd) + 's' : 'pronto';
   }
   const ft = Math.round(hOf(P) * 100); $('altv').textContent = ft + ' ft' + (P.vs > 3 ? ' ▲' : P.vs < -3 ? ' ▼' : '');
-  $('altv').style.color = ft < 1200 ? '#ff4b3a' : '';
+  $('altv').style.color = hOf(P) - terrainH(P.x, P.y) < 12 || P.gpws ? '#ff4b3a' : '';
   const hh = Math.floor(tod), mm = Math.floor((tod - hh) * 60 / 10) * 10;
   $('clock').textContent = String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') + (LIGHT.night > .5 ? ' ☾' : LIGHT.light > .9 ? ' ☀' : ' ◐');
   dmgT -= 1 / 60; $('dmg').style.opacity = dmgT > 0 ? 1 : 0;
