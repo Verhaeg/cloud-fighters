@@ -11,6 +11,8 @@ _a pixel-art dogfight in one html file: 360° flight, guns, missiles, mountains 
 
 </div>
 
+multiplayer with no server: everyone who opens the page on the same day (UTC) shares the same world and can shoot each other. Pick a name and a jet on the start screen. Browsers connect peer to peer over WebRTC, found through public Nostr relays ([Trystero](https://github.com/dmotz/trystero)).
+
 play in the browser (on iPad, share → add to home screen for fullscreen and offline):
 
 ```bash
